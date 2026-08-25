@@ -1,219 +1,273 @@
-#!/bin/sh
+#!/bin/bash
 
-set -e
+set -Eeuo pipefail
 
-hide_dock_automatically() {
-  /usr/bin/osascript - <<'EOF'
-tell application "System Preferences"
-    activate
-    set current pane to pane "com.apple.preference.dock"
-end tell
-tell application "System Events" to tell process "System Preferences"
-    tell window "Dock"
-        set theCheckbox to checkbox "自动显示和隐藏 Dock"  —- Automatically hide and show the Dock
-        tell theCheckbox
-            set checkboxStatus to value of theCheckbox as boolean
-            if not checkboxStatus then click theCheckbox
-        end tell
-    end tell
-end tell
-delay 0.5
-tell application "System Preferences" to quit
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly BREW_BIN="/opt/homebrew/bin/brew"
+
+MODE="install"
+UPGRADE=0
+CONFIGURE_DEFAULTS=1
+CONFIGURE_DOTFILES=1
+INSTALL_APPS=1
+
+usage() {
+  cat <<'EOF'
+Usage: ./run.sh [options]
+
+Bootstrap an Apple Silicon Mac from this repository.
+
+Options:
+  --check                 Check the machine without changing it
+  --upgrade               Upgrade outdated Brewfile packages
+  --skip-macos-defaults   Do not change Dock or Finder preferences
+  --skip-dotfiles         Do not add the managed zsh blocks or install .vimrc
+  --skip-apps             Skip casks and VS Code extensions (useful while migrating)
+  -h, --help              Show this help
 EOF
 }
 
-install_xcode_cmdline_tools() {
+log() {
+  printf '\n\033[1;34m==>\033[0m %s\n' "$*"
+}
+
+warn() {
+  printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2
+}
+
+die() {
+  printf '\033[1;31merror:\033[0m %s\n' "$*" >&2
+  exit 1
+}
+
+while (($#)); do
+  case "$1" in
+    --check)
+      MODE="check"
+      ;;
+    --upgrade)
+      UPGRADE=1
+      ;;
+    --skip-macos-defaults)
+      CONFIGURE_DEFAULTS=0
+      ;;
+    --skip-dotfiles)
+      CONFIGURE_DOTFILES=0
+      ;;
+    --skip-apps)
+      INSTALL_APPS=0
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "unknown option: $1"
+      ;;
+  esac
+  shift
+done
+
+require_apple_silicon() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "this bootstrap supports macOS only"
+  [[ "$(uname -m)" == "arm64" ]] || die "this bootstrap requires a native Apple Silicon shell (arm64)"
+}
+
+ensure_command_line_tools() {
+  if xcode-select -p >/dev/null 2>&1; then
+    return
+  fi
+
+  log "Requesting Xcode Command Line Tools"
   xcode-select --install
-  read -n 1 -p 'Press [Enter] when install complate.'
-}
-
-install_oh_my_zsh() {
-  sh -c "$(curl -fsSL https://raw.github.com/robbyrussell/oh-my-zsh/master/tools/install.sh)"
-}
-
-install_zimfw() {
-  curl -fsSL https://raw.githubusercontent.com/zimfw/install/master/install.zsh | zsh
-}
-
-setup_shell() {
-  brew install zsh
-
-  brew install zsh-autosuggestions
-  cat <<'EOF' >> ~/.zshrc
-
-source /usr/local/share/zsh-autosuggestions/zsh-autosuggestions.zsh
+  cat <<'EOF'
+Complete the installer window, then run ./run.sh again.
 EOF
-
-  brew install starship
-  cat <<'EOF' >> ~/.zshrc
-
-eval "$(starship init zsh)"
-EOF
-  mkdir -p ~/.config && touch ~/.config/starship.toml
-  brew tap homebrew/cask-fonts
-  brew install font-fira-code-nerd-font
+  exit 0
 }
 
-setup_homebrew() {
-  ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)" && brew update
+ensure_homebrew() {
+  if [[ ! -x "$BREW_BIN" ]]; then
+    log "Installing native Homebrew in /opt/homebrew"
+    NONINTERACTIVE=1 /bin/bash -c \
+      "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  fi
+
+  # shellcheck disable=SC1090
+  eval "$("$BREW_BIN" shellenv)"
+  [[ "$(brew --prefix)" == "/opt/homebrew" ]] || die "Homebrew did not resolve to /opt/homebrew"
 }
 
-bundle_homebrew() {
-  brew bundle --file="./Brewfile"
+install_brew_bundle() {
+  local bundle_file="$SCRIPT_DIR/Brewfile"
+  local filtered_bundle=""
+
+  log "Installing the Apple Silicon Brewfile"
+
+  if ((!INSTALL_APPS)); then
+    filtered_bundle="$(mktemp "${TMPDIR:-/tmp}/mac-init-brewfile.XXXXXX")"
+    awk '!/^(cask|vscode) / { print }' "$bundle_file" >"$filtered_bundle"
+    bundle_file="$filtered_bundle"
+  fi
+
+  if ((UPGRADE)); then
+    brew bundle --file="$bundle_file" --upgrade
+  else
+    brew bundle --file="$bundle_file" --no-upgrade
+  fi
+
+  if [[ -n "$filtered_bundle" ]]; then
+    rm -f "$filtered_bundle"
+  fi
+}
+
+update_managed_block() {
+  local target="$1"
+  local source_file="$2"
+  local start_marker="# >>> mac-init managed block >>>"
+  local end_marker="# <<< mac-init managed block <<<"
+  local temporary
+  local backup
+
+  temporary="$(mktemp "${TMPDIR:-/tmp}/mac-init.XXXXXX")"
+
+  if [[ -f "$target" ]]; then
+    awk -v start="$start_marker" -v end="$end_marker" '
+      $0 == start { skipping = 1; next }
+      $0 == end   { skipping = 0; next }
+      !skipping   { print }
+    ' "$target" >"$temporary"
+  else
+    : >"$temporary"
+  fi
+
+  if [[ -s "$temporary" ]] && [[ "$(tail -c 1 "$temporary" | wc -l | tr -d ' ')" == "0" ]]; then
+    printf '\n' >>"$temporary"
+  fi
+
+  {
+    printf '%s\n' "$start_marker"
+    cat "$source_file"
+    printf '%s\n' "$end_marker"
+  } >>"$temporary"
+
+  if [[ -f "$target" ]] && cmp -s "$temporary" "$target"; then
+    rm -f "$temporary"
+    return
+  fi
+
+  if [[ -f "$target" ]]; then
+    backup="${target}.mac-init-backup.$(date +%Y%m%d%H%M%S)"
+    cp -p "$target" "$backup"
+    log "Backed up $target to $backup"
+  fi
+
+  mv "$temporary" "$target"
+}
+
+configure_shell() {
+  log "Updating managed zsh configuration"
+  update_managed_block "$HOME/.zprofile" "$SCRIPT_DIR/config/zprofile"
+  update_managed_block "$HOME/.zshrc" "$SCRIPT_DIR/config/zshrc"
+}
+
+configure_vim() {
+  local target="$HOME/.vimrc"
+
+  if [[ ! -e "$target" ]]; then
+    install -m 0644 "$SCRIPT_DIR/.vimrc" "$target"
+  elif ! cmp -s "$SCRIPT_DIR/.vimrc" "$target"; then
+    warn "$target already exists and differs; leaving it unchanged"
+  fi
+
+  if [[ ! -f "$HOME/.vim/autoload/plug.vim" ]]; then
+    log "Installing vim-plug"
+    curl -fLo "$HOME/.vim/autoload/plug.vim" --create-dirs \
+      https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
+  fi
+}
+
+configure_git() {
+  if ! git config --global --get core.editor >/dev/null; then
+    git config --global core.editor vim
+  fi
+
+  if [[ -n "${GIT_USER_NAME:-}" ]]; then
+    git config --global user.name "$GIT_USER_NAME"
+  fi
+  if [[ -n "${GIT_USER_EMAIL:-}" ]]; then
+    git config --global user.email "$GIT_USER_EMAIL"
+  fi
+
+  if ! git config --global --get user.name >/dev/null || \
+     ! git config --global --get user.email >/dev/null; then
+    warn "Git identity is incomplete; set GIT_USER_NAME and GIT_USER_EMAIL before rerunning"
+  fi
+}
+
+configure_runtimes() {
+  local rustup_bin
+
+  log "Ensuring current Node.js LTS and Rust stable toolchains"
+  eval "$(fnm env --shell bash)"
+  fnm install --lts
+  fnm default lts-latest
+
+  rustup_bin="$(brew --prefix rustup)/bin/rustup"
+  "$rustup_bin" set default-host aarch64-apple-darwin
+  if ! "$rustup_bin" toolchain list | grep -q '^stable-aarch64-apple-darwin'; then
+    "$rustup_bin" toolchain install stable --profile default
+  fi
+  "$rustup_bin" default stable-aarch64-apple-darwin
+}
+
+configure_macos() {
+  log "Applying macOS preferences"
+  defaults write com.apple.dock autohide -bool true
+  defaults write com.apple.finder AppleShowAllFiles -bool true
+  killall Dock >/dev/null 2>&1 || true
+  killall Finder >/dev/null 2>&1 || true
 }
 
 prepare_folders() {
-  mkdir -p ~/code/github
-  mkdir -p ~/code/github-self
+  mkdir -p "$HOME/code/github" "$HOME/code/github-self" "$HOME/go/bin"
 }
 
-config_git() {
-  cat <<'EOF' > ~/.gitconfig
-[user]
-	name = ld000
-	email = lidong9144@163.com
-[core]
-	editor = vim
-EOF
+warn_about_intel_homebrew() {
+  if [[ -x /usr/local/bin/brew ]]; then
+    warn "Intel Homebrew still exists at /usr/local; it was not modified or removed"
+  fi
 }
 
-config_vim() {
-  mkdir -p ~/.vim ~/.vim/autoload ~/.vim/backup ~/.vim/colors ~/.vim/plugged
-  # touch ~/.vimrc
-  copy ./.vimrc ~/.vimrc
+main() {
+  require_apple_silicon
 
-  curl -fLo ~/.vim/autoload/plug.vim --create-dirs \
-    https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
+  if [[ "$MODE" == "check" ]]; then
+    exec "$SCRIPT_DIR/scripts/doctor.sh"
+  fi
+
+  ensure_command_line_tools
+  ensure_homebrew
+  warn_about_intel_homebrew
+  prepare_folders
+  install_brew_bundle
+  configure_runtimes
+  configure_git
+
+  if ((CONFIGURE_DOTFILES)); then
+    configure_shell
+    configure_vim
+  fi
+
+  if ((CONFIGURE_DEFAULTS)); then
+    configure_macos
+  fi
+
+  log "Bootstrap complete"
+  printf '%s\n' "Open a new terminal, then run: ./run.sh --check"
 }
 
-setup_java() {
-  cat <<'EOF' >> ~/.zshrc
-
-export JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-13.0.1.jdk/Contents/Home 
-export JRE_HOME=${JAVA_HOME}/jre  
-export CLASSPATH=.:${JAVA_HOME}/lib:${JRE_HOME}/lib  
-export PATH=${JAVA_HOME}/bin:$PATH
-EOF
-}
-
-setup_go() {
-  download_url=https://dl.google.com/go/go1.13.3.darwin-amd64.pkg
-  pkg_file=${download_url##*/}
-  curl -LO $download_url
-  sudo installer -pkg $pkg_file -target /
-  rm $pkg_file
-
-  cat <<'EOF' >> ~/.zshrc
-
-export GOROOT=/usr/local/go
-export GOPATH=$HOME/go
-export PATH=$PATH:$GOROOT/bin:$GOPATH/bin
-export GO111MODULE=auto
-export GOPROXY=https://goproxy.cn
-EOF
-
-  cat <<'EOF' >> ~/.bash_profile
-
-export GOROOT=/usr/local/go
-export GOPATH=$HOME/go
-export PATH=$PATH:$GOROOT/bin:$GOPATH/bin
-export GO111MODULE=auto
-export GOPROXY=https://goproxy.cn
-EOF
-
-  source ~/.bash_profile
-  mkdir -p $GOPATH
-}
-
-setup_js() {
-  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.35.0/install.sh | bash
-  echo '' >> ~/.zshrc
-  echo 'export NVM_DIR="$HOME/.nvm"' >> ~/.zshrc
-  echo '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" # This loads nvm' >> ~/.zshrc
-  echo '[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion' >> ~/.zshrc
-  source ~/.bash_profile
-
-  nvm install 4
-  nvm install 6
-  nvm install 8
-
-  npm install --global yrm --registry=https://registry.npm.taobao.org
-
-  yrm use cnpm
-  npm i -g yarn
-}
-
-setup_ssh() {
-  ssh-keygen -C lidong9144@163.com
-  cat ~/.ssh/id_rsa.pub
-}
-
-show_hide_file() {
-  defaults write com.apple.Finder AppleShowAllFiles YES;KillAll Finder
-}
-
-setup_maven() {
-  download_url=https://mirrors.tuna.tsinghua.edu.cn/apache/maven/maven-3/3.6.2/binaries/apache-maven-3.6.2-bin.tar.gz
-  tar_file=${download_url##*/}
-  curl -LO $download_url
-  tar xzvf ./apache-maven-3.6.2-bin.tar.gz
-  mv apache-maven-3.6.2 ~/depend/
-  rm -rf apache-maven-3.6.2-bin.tar.gz
-
-  cat <<'EOF' >> ~/.zshrc
-
-export MAVEN_PATH=$HOME/depend/apache-maven-3.6.2
-export PATH=$PATH:$MAVEN_PATH/bin
-EOF
-}
-
-setup_font() {
-  brew tap homebrew/cask-fonts
-  brew install font-fira-code
-}
-
-fancy_echo() {
-  local fmt="$1"; shift
-
-  # shellcheck disable=SC2059
-  printf "\\n$fmt\\n" "$@"
-}
-
-# run function
-hide_dock_automatically
-show_hide_file
-
-install_xcode_cmdline_tools
-
-prepare_folders
-
-setup_homebrew
-bundle_homebrew
-
-# install_oh_my_zsh
-# install_zimfw
-setup_shell
-
-# mysql should start on launch
-# ln -sfv /usr/local/opt/mysql/*.plist ~/Library/LaunchAgents
-
-setup_go
-# setup_js
-
-config_git
-config_vim
-setup_java
-setup_maven
-setup_ssh
-# setup_font
-
-# Hold my own hand to make sure I finish configuring.
-echo "Don't forget that you need to:
-1. Add your ssh keys (you put them in your secret hiding place)."
-read -n 1 -p 'Press [Enter] when you have added your ssh key.'
-echo "2. source ~/.zshrc"
-read -n 1 -p 'Press [Enter] when you have execute the command.'
-echo "3. vim :PluginInstall"
-read -n 1 -p 'Press [Enter] when you have execute the command.'
-echo "4. iterm2: Preferences>Profiles>Text>Non-ASCII Font is the same as your main Font(fira code)"
-read -n 1 -p 'Press [Enter] when you have execute the command.'
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main
+fi
